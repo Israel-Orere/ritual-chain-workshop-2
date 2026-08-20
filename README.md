@@ -1,108 +1,110 @@
-# Ritual Predict
+# Ritual Predict — Bootcamp 2 Proof of Building
 
-A self-resolving binary prediction market on [Ritual Chain](https://docs.ritualfoundation.org).
+A self-resolving binary prediction market on Ritual Chain. This repository is a **direct fork of the official Bootcamp 2 workshop** and keeps the required `ritual-chain-workshop-2` repository name and fork lineage.
 
-Create a market like _"Will ETH/USD be at least $4,000 when this market resolves?"_, stake native
-RITUAL on YES or NO, and watch it settle itself. When the betting window closes, **nobody presses a
-resolve button and no backend cron job runs**. The Ritual Scheduler wakes the contract at a block
-fixed when the market was created; the contract calls the HTTP precompile to read the configured
-oracle URL, extracts one number with the jq precompile, compares it to the target, and settles.
-Winners then pull their proportional share of the pool.
+## What I built
 
----
+I completed the unfinished workshop paths in `RitualPredict.sol` and extended the reference implementation with frontend-friendly market analytics and a dedicated local test suite.
 
-## Architecture
+### Core implementation completed
 
+- `createMarket` validates the resolution rule, converts human durations into block deadlines, stores immutable market parameters and schedules autonomous resolution.
+- `onScheduledResolve` authorizes the Ritual Scheduler, selects a TEE executor, reads the oracle, applies the configured comparator and finalizes the market.
+- `_readOracle` uses Ritual's HTTP precompile and jq precompile, with explicit handling for executor, HTTP, envelope and parsing failures.
+- `_pickExecutor` uses the TEE Service Registry instead of hardcoding an executor.
+- `_scheduleResolution` books three resolution attempts, 200 blocks apart, and successful/terminal markets cancel the remaining schedule.
+- Oracle failure is never interpreted as a NO outcome. After the final failed attempt the market becomes invalid and bettors can reclaim their original stake.
+
+### My extensions
+
+1. **Implied market odds** — `impliedOdds(marketId)` returns YES/NO pool probabilities in basis points. A 3 RITUAL YES pool and 1 RITUAL NO pool reads as 75% / 25%.
+2. **Pre-bet payout quotes** — `potentialPayout(...)` lets a frontend show the user's hypothetical pari-mutuel payout before submitting a transaction.
+3. **Resolution-rule preview** — `previewOutcome(...)` makes GT/GTE/LT/LTE behavior directly inspectable and easy to test.
+4. **Local Hardhat path** — Ritual system contracts do not exist on chain id 31337, so local market creation uses a deterministic placeholder schedule id while preserving the real Scheduler path on Ritual Chain.
+5. **Behavior-focused tests** — `hardhat/test/RitualPredict.ts` covers market creation, immutable rule storage, YES/NO pools, implied odds, payout quoting, all four comparator rules, invalid input, zero-value bets and block-number betting deadlines.
+
+## How the market resolves
+
+```text
+createMarket()
+      |
+      v
+Ritual Scheduler books 3 calls
+      |
+      v
+resolveBlock reached
+      |
+      v
+TEE Service Registry -> HTTP-capable executor
+      |
+      v
+HTTP precompile (0x0801) -> configured oracle URL
+      |
+      v
+jq precompile (0x0803) -> uint256 observed value
+      |
+      v
+observed value vs target + comparator
+      |
+      +---- YES/NO has liquidity ---> Resolved -> winners claim
+      |
+      +---- winning side empty ------> Invalid -> everyone refunds
+      |
+      +---- oracle read fails -------> retry (max 3) -> Invalid/refund
 ```
-                 createMarket()                    ┌──────────────────────────┐
-   user  ─────────────────────────────────────────▶│  RitualPredict.sol       │
-   user  ─────────── bet(id, YES|NO) ─────────────▶│                          │
-                                                   │  markets, pools, stakes  │
-                                     schedule() ◀──┤                          │
-                                                   └──────────────────────────┘
-    ┌─────────────────────────────┐                     ▲              │
-    │ Scheduler  0x56e7…D58B      │  onScheduledResolve │              │ deposit()
-    │ system contract             │─────────────────────┘              ▼
-    │ fires at resolveBlock,      │                        ┌────────────────────────┐
-    │ 3 attempts, 200 blocks apart│                        │ RitualWallet 0x532F…   │
-    └─────────────────────────────┘                        │ prepaid execution fees │
-                                                           └────────────────────────┘
-                        inside that one scheduled transaction:
 
-   TEEServiceRegistry 0x9644…  ──pickServiceByCapability(HTTP_CALL)──▶  executor address
-   HTTP precompile    0x0801   ──GET oracleUrl (in a TEE)───────────▶  demo oracle
-   jq  precompile     0x0803   ──jsonPath, outputType=uint256───────▶  observed value
-                                          │
-                                          ▼
-                        observed ⋈ target  →  Resolved(YES|NO)
-                        read failed 3×     →  Invalid (everyone refunds)
-```
+There is no privileged human resolver and no backend cron job deciding the result.
 
----
+## Key design decisions
 
-### Design decisions worth knowing
+**Block-number deadlines.** Betting closes at `closeBlock` and the Scheduler wakes the contract at `resolveBlock`, so the two lifecycle rules use the same clock.
 
-**Deadlines are block numbers, not timestamps.** The Scheduler fires at a _block_, so betting also
-closes at a _block_. That way "betting is closed" and "the Scheduler woke us" can never disagree,
-whatever the chain's block time does. `createMarket` takes human durations in seconds and converts
-them using the `blockTimeMs` fixed at deployment. Nothing on-chain reads `block.timestamp`.
+**Immutable resolution rules.** `oracleUrl`, `jsonPath`, `target`, `comparator` and resolution blocks are fixed when the market is created. `ResolutionRuleSet` leaves an auditable creation-time record.
 
-**On Ritual Chain, `block.timestamp` is Unix milliseconds** (≈`1.786e12`), not seconds — verified
-against the live chain, not assumed. That is a good reason to avoid it entirely, which this contract
-does. Measured block time was ≈195 ms when this was written; run
-`npx hardhat run scripts/block-time.ts` to check it for yourself.
+**Failure is distinct from NO.** A missing TEE executor, reverted HTTP precompile, malformed async response, non-200 response, empty body or jq failure consumes a resolution attempt rather than deciding the prediction incorrectly.
 
-**A failed oracle read is never a NO.** `onScheduledResolve` treats a precompile failure, a non-200
-response, an undecodable envelope, an executor error message, and an unparseable body all as
-_failures_, not as a negative outcome. The response decode happens through an external `try`, so
-malformed bytes surface as a caught failure instead of reverting the execution and rolling back the
-attempt counter.
+**Pull-based settlement.** Winners claim their own proportional share using `stake × totalPool / winningPool`; the contract never loops over all bettors. Invalid markets use the same pull pattern for refunds.
 
-**Retries are the Scheduler's own mechanism.** `createMarket` books `numCalls = 3` executions
-`frequency = 200` blocks apart in a single `schedule()` call. Attempt 1 lands at `resolveBlock`; if
-it succeeds, the contract `cancel()`s the remainder; if all three fail, the market becomes `Invalid`
-and every stake is refundable. Each attempt re-rolls the TEE executor seed, so one unhealthy
-executor cannot sink a market. The callback is idempotent, so a leftover execution is harmless.
-
-**No executor is hardcoded.** The contract calls
-`TEEServiceRegistry.pickServiceByCapability(HTTP_CALL, true, seed, 8)` at resolution time.
-
-**Payouts are pull-based and loop-free.** `claimWinnings` computes
-`stake × totalPool ÷ winningPool` for the caller only. Integer division leaves sub-wei dust in the
-contract; that is deliberate and negligible.
-
-**Empty winning side → refundable.** Pari-mutuel has no denominator when nobody backed the winning
-answer, so the market records the outcome and observed value, then becomes `Invalid` so everyone
-takes their stake back.
-
-**Resolution parameters are immutable.** `target`, `comparator`, `oracleUrl`, `jsonPath`, and
-`resolveBlock` have no setter. The `ResolutionRuleSet` event records them at creation.
-
----
-
-## Prerequisites
-
-- Node.js 20+ and `pnpm`
-- A wallet with testnet RITUAL from <https://faucet.ritualfoundation.org>
-
-## Setup
+## Run locally
 
 ```bash
 cd hardhat
 pnpm install
+npx hardhat compile
+npx hardhat test test/RitualPredict.ts
+```
+
+To run a persistent local node:
+
+```bash
+npx hardhat node
+```
+
+The local test path deliberately avoids pretending that Ritual's Scheduler/TEE/HTTP system contracts exist on Hardhat. The actual autonomous resolution path remains enabled on Ritual Chain.
+
+## Ritual Chain setup
+
+```bash
+cd hardhat
 cp .env.example .env
 ```
 
----
+Add the required wallet configuration from `.env.example`, fund it with testnet RITUAL, measure/check block time with the supplied script, deploy, and fund the contract's RitualWallet execution balance before creating live markets.
 
-## Scope
+## Files changed for Proof of Building
 
-Intentionally not included: an AMM, an order book, an order-matching engine, governance, a separate
-ERC-20, a centralized resolver, or an upgrade proxy. Staking uses the chain's native asset and the
-betting model is plain pari-mutuel: two running totals and one mapping per side.
+- `hardhat/contracts/RitualPredict.sol` — completed contract + odds/payout/preview extensions + local development path.
+- `hardhat/test/RitualPredict.ts` — dedicated prediction-market tests.
+- `README.md` — implementation notes, architecture, extensions and reproduction instructions.
 
-## Reference
+## What I learned
 
-- Ritual Chain docs — <https://docs.ritualfoundation.org>
-- dApp skills — <https://github.com/ritual-foundation/ritual-dapp-skills>
-- Explorer — <https://explorer.ritualfoundation.org> · Faucet — <https://faucet.ritualfoundation.org>
+The important part of a self-resolving prediction market is not merely fetching a number. Resolution needs a deterministic lifecycle and a safe failure model. In particular, an unavailable oracle cannot be treated as a false prediction. Ritual's Scheduler + TEE execution + HTTP/jq precompiles let the resolution rule live with the market itself while retries and refunds provide a clean terminal state when external data cannot be obtained.
+
+## References
+
+- Ritual Chain documentation: https://docs.ritualfoundation.org
+- Ritual dApp skills: https://github.com/ritual-foundation/ritual-dapp-skills
+- Ritual explorer: https://explorer.ritualfoundation.org
+- Ritual faucet: https://faucet.ritualfoundation.org
+- Upstream workshop: https://github.com/cozfuttu/ritual-chain-workshop-2
